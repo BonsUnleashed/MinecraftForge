@@ -9,6 +9,9 @@ import java.lang.annotation.ElementType;
 import java.lang.reflect.Field;
 import java.util.Collection;
 import java.util.HashSet;
+import java.util.HashMap;
+import java.util.ArrayList;
+import java.util.ConcurrentModificationException;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -43,7 +46,8 @@ public class ObjectHolderRegistry
      */
     public static synchronized void addHandler(Consumer<Predicate<ResourceLocation>> ref)
     {
-        objectHolders.add(ref);
+        if (objectHolders.add(ref))
+            holderVersion++;
     }
 
     /**
@@ -57,7 +61,10 @@ public class ObjectHolderRegistry
      */
     public static synchronized boolean removeHandler(Consumer<Predicate<ResourceLocation>> ref)
     {
-        return objectHolders.remove(ref);
+        boolean changed = objectHolders.remove(ref);
+        if (changed)
+            holderVersion++;
+        return changed;
     }
 
     //==============================================================
@@ -66,6 +73,7 @@ public class ObjectHolderRegistry
 
     private static final Logger LOGGER = LogManager.getLogger();
     private static final Set<Consumer<Predicate<ResourceLocation>>> objectHolders = new HashSet<>();
+    private static volatile long holderVersion;
     private static final Type OBJECT_HOLDER = Type.getType(ObjectHolder.class);
     private static final Type MOD = Type.getType(Mod.class);
     // Hardcoded list of vanilla classes that should have object holders for each field of the given registry type.
@@ -238,6 +246,86 @@ public class ObjectHolderRegistry
         if (aggregate.getSuppressed().length > 0)
         {
             throw aggregate;
+        }
+    }
+
+    /** Internal handler whose registry check can settle after its first call. */
+    static abstract class RegistryObjectHandler implements Consumer<Predicate<ResourceLocation>>
+    {
+        final ResourceLocation registryName;
+
+        RegistryObjectHandler(ResourceLocation registryName)
+        {
+            this.registryName = registryName;
+        }
+
+        abstract boolean needsValidation();
+        abstract boolean isInvalid();
+    }
+
+    /** Reused only for the registry-by-registry passes in GameData.postRegisterEvents. */
+    static final class RegistryPass
+    {
+        private static final int ALWAYS = -1, UNSETTLED = -2, INVALID = -3;
+        private List<Consumer<Predicate<ResourceLocation>>> holders = List.of();
+        private int[] registryIds = new int[0];
+        private final Map<ResourceLocation, Integer> ids = new HashMap<>();
+        private long version = -1;
+
+        private int classify(Consumer<Predicate<ResourceLocation>> holder)
+        {
+            if (!(holder instanceof RegistryObjectHandler known))
+                return ALWAYS;
+            if (known.isInvalid())
+                return INVALID;
+            if (known.needsValidation())
+                return UNSETTLED;
+            return ids.computeIfAbsent(known.registryName, key -> ids.size());
+        }
+
+        private void rebuild()
+        {
+            holders = new ArrayList<>(objectHolders);
+            registryIds = new int[holders.size()];
+            ids.clear();
+            for (int i = 0; i < holders.size(); i++)
+                registryIds[i] = classify(holders.get(i));
+            version = holderVersion;
+        }
+
+        void apply(ResourceLocation registryName)
+        {
+            if (version != holderVersion || holders.size() != objectHolders.size())
+                rebuild();
+            int id = ids.getOrDefault(registryName, Integer.MIN_VALUE);
+            Predicate<ResourceLocation> filter = registryName::equals;
+            RuntimeException aggregate = new RuntimeException("Failed to apply some object holders, see suppressed exceptions for details");
+            for (int i = 0; i < holders.size(); i++)
+            {
+                int code = registryIds[i];
+                if (code >= 0 ? code != id : code == INVALID)
+                    continue;
+                var holder = holders.get(i);
+                try
+                {
+                    holder.accept(filter);
+                }
+                catch (Exception e)
+                {
+                    aggregate.addSuppressed(e);
+                }
+                if (version != holderVersion)
+                {
+                    // HashSet's iterator fails at the next element after a structural change.
+                    if (i + 1 < holders.size())
+                        throw new ConcurrentModificationException();
+                    break;
+                }
+                if (code == UNSETTLED)
+                    registryIds[i] = classify(holder);
+            }
+            if (aggregate.getSuppressed().length > 0)
+                throw aggregate;
         }
     }
 

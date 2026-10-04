@@ -160,10 +160,22 @@ public final class RegistryObject<T> implements Supplier<T>
         this.key = ResourceKey.create(ResourceKey.createRegistryKey(registryName), name);
         this.optionalRegistry = optionalRegistry;
         final Throwable callerStack = new Throwable("Calling Site from mod: " + modid);
-        ObjectHolderRegistry.addHandler(new Consumer<>()
+        ObjectHolderRegistry.addHandler(new ObjectHolderRegistry.RegistryObjectHandler(registryName)
         {
             private boolean registryExists = false;
             private boolean invalidRegistry = false;
+
+            @Override
+            boolean needsValidation()
+            {
+                return !RegistryObject.this.optionalRegistry && !registryExists;
+            }
+
+            @Override
+            boolean isInvalid()
+            {
+                return invalidRegistry;
+            }
 
             @Override
             public void accept(Predicate<ResourceLocation> pred)
