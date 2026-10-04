@@ -16,7 +16,9 @@ import net.minecraftforge.fml.IExtensionPoint;
 import net.minecraftforge.fml.ModList;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -79,6 +81,48 @@ public record ServerStatusPing(
         boolean truncated
 )
 {
+    private record SerializedPing(Object[] input, byte[] bytes) {}
+    private record EncodedPing(byte[] bytes, String text) {}
+    private static volatile SerializedPing lastSerialized;
+    private static volatile EncodedPing lastEncoded;
+
+    // The wire format follows map iteration order, so Map.equals is not a sufficient cache key.
+    private Object[] serializationInput()
+    {
+        // getNonModChannels also uses containsKey. Ordered entries do not capture a
+        // custom map's membership rules (e.g. identity keys or case-insensitive keys).
+        if ((mods.getClass() != HashMap.class && mods.getClass() != LinkedHashMap.class)
+                || (channels.getClass() != HashMap.class && channels.getClass() != LinkedHashMap.class))
+            return null;
+        Object[] input = new Object[2 + mods.size() * 2 + channels.size() * 3];
+        int i = 0;
+        input[i++] = mods.size();
+        input[i++] = channels.size();
+        for (var entry : mods.entrySet())
+        {
+            input[i++] = entry.getKey();
+            input[i++] = entry.getValue();
+        }
+        for (var entry : channels.entrySet())
+        {
+            // Subclasses can expose mutable names despite retaining the same key identity.
+            // Keep unsupported/null data on the original path, including its truncation behavior.
+            if (entry.getKey() == null || entry.getKey().getClass() != ResourceLocation.class || entry.getValue() == null)
+                return null;
+            input[i++] = entry.getKey();
+            input[i++] = entry.getValue().version();
+            input[i++] = entry.getValue().required();
+        }
+        return input;
+    }
+
+    private static byte[] readableBytes(ByteBuf buf)
+    {
+        byte[] bytes = new byte[buf.readableBytes()];
+        buf.getBytes(buf.readerIndex(), bytes);
+        return bytes;
+    }
+
     private static final Codec<ByteBuf> BYTE_BUF_CODEC = Codec.STRING
             .xmap(ServerStatusPing::decodeOptimized, ServerStatusPing::encodeOptimized);
 
@@ -153,6 +197,10 @@ public record ServerStatusPing(
     }
 
     public ByteBuf toBuf() {
+        Object[] input = serializationInput();
+        SerializedPing previous = lastSerialized;
+        if (input != null && previous != null && Arrays.equals(previous.input, input))
+            return new FriendlyByteBuf(Unpooled.copiedBuffer(previous.bytes));
         // The following techniques are used to keep the size down:
         // 1. Try and group channels by ModID, this relies on the assumption that a mod "examplemod" uses a channel
         //    like "examplemod:network". In that case only the "path" of the ResourceLocation is written
@@ -227,6 +275,8 @@ public record ServerStatusPing(
         }
 
         buf.setBoolean(0, reachedSizeLimit);
+        if (input != null)
+            lastSerialized = new SerializedPing(input, readableBytes(buf));
         return buf;
     }
 
@@ -283,6 +333,14 @@ public record ServerStatusPing(
      */
     private static String encodeOptimized(ByteBuf buf)
     {
+        byte[] bytes = readableBytes(buf);
+        EncodedPing previous = lastEncoded;
+        if (previous != null && Arrays.equals(previous.bytes, bytes))
+        {
+            buf.readerIndex(buf.writerIndex());
+            buf.release();
+            return previous.text;
+        }
         var byteLength = buf.readableBytes();
         var sb = new StringBuilder();
         sb.append((char) (byteLength & 0x7FFF));
@@ -310,7 +368,9 @@ public record ServerStatusPing(
             char c = (char) (buffer & 0x7FFF);
             sb.append(c);
         }
-        return sb.toString();
+        String text = sb.toString();
+        lastEncoded = new EncodedPing(bytes, text);
+        return text;
     }
 
     /**
